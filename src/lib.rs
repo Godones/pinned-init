@@ -258,7 +258,11 @@ use core::{
 };
 
 #[cfg(feature = "alloc")]
+use alloc::alloc::Global;
+#[cfg(feature = "alloc")]
 use core::alloc::AllocError;
+#[cfg(feature = "alloc")]
+use core::alloc::Allocator;
 
 // Allocations are infallible without the allocator API.  In that case, just
 // require From<Infallible> for the trait that is passed to the try_* macros,
@@ -1164,6 +1168,48 @@ unsafe impl<T, E> PinInit<T, E> for T {
     }
 }
 
+/// Smart pointer that can initialize memory in-place. This is the version that takes an allocator.
+pub trait InPlaceInitIn<T, A: Allocator>: Sized {
+    /// Use the given pin-initializer to pin-initialize a `T` inside of a new smart pointer of this
+    /// type.
+    ///
+    /// If `T: !Unpin` it will not be able to move afterwards.
+    fn try_pin_init_in<E>(init: impl PinInit<T, E>, alloc: A) -> Result<Pin<Self>, E>
+    where
+        E: From<AllocError>;
+
+    /// Use the given pin-initializer to pin-initialize a `T` inside of a new smart pointer of this
+    /// type.
+    ///
+    /// If `T: !Unpin` it will not be able to move afterwards.
+    fn pin_init_in(init: impl PinInit<T>, alloc: A) -> Result<Pin<Self>, AllocError> {
+        // SAFETY: We delegate to `init` and only change the error type.
+        let init = unsafe {
+            pin_init_from_closure(|slot| match init.__pinned_init(slot) {
+                Ok(()) => Ok(()),
+                Err(i) => match i {},
+            })
+        };
+        Self::try_pin_init_in(init, alloc)
+    }
+    /// Use the given initializer to in-place initialize a `T`.
+    fn try_init_in<E>(init: impl Init<T, E>, alloc: A) -> Result<Self, E>
+    where
+        E: From<AllocError>;
+
+    /// Use the given initializer to in-place initialize a `T`.
+    fn init_in(init: impl Init<T>, alloc: A) -> Result<Self, AllocError> {
+        // SAFETY: We delegate to `init` and only change the error type.
+        let init = unsafe {
+            init_from_closure(|slot| match init.__init(slot) {
+                Ok(()) => Ok(()),
+                Err(i) => match i {},
+            })
+        };
+        Self::try_init_in(init, alloc)
+    }
+}
+
 /// Smart pointer that can initialize memory in-place.
 pub trait InPlaceInit<T>: Sized {
     /// Use the given pin-initializer to pin-initialize a `T` inside of a new smart pointer of this
@@ -1213,11 +1259,34 @@ macro_rules! try_new_uninit {
         $type::try_new_uninit()?
     };
 }
+
+#[cfg(feature = "alloc")]
+macro_rules! try_new_uninit_in {
+    ($type:ident, $alloc:ident) => {
+        $type::try_new_uninit_in($alloc)?
+    };
+}
+
 #[cfg(all(feature = "std", not(feature = "alloc")))]
 macro_rules! try_new_uninit {
     ($type:ident) => {
         $type::new_uninit()
     };
+}
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<T, A: Allocator + 'static> InPlaceInitIn<T, A> for Box<T, A> {
+    fn try_pin_init_in<E>(init: impl PinInit<T, E>, alloc: A) -> Result<Pin<Self>, E>
+    where
+        E: From<AllocError>,
+    {
+        try_new_uninit_in!(Box, alloc).write_pin_init(init)
+    }
+    fn try_init_in<E>(init: impl Init<T, E>, alloc: A) -> Result<Self, E>
+    where
+        E: From<AllocError>,
+    {
+        try_new_uninit_in!(Box, alloc).write_init(init)
+    }
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -1236,6 +1305,42 @@ impl<T> InPlaceInit<T> for Box<T> {
         E: From<AllocError>,
     {
         try_new_uninit!(Box).write_init(init)
+    }
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<T, A: Allocator> InPlaceInitIn<T, A> for Arc<T, A> {
+    fn try_pin_init_in<E>(init: impl PinInit<T, E>, alloc: A) -> Result<Pin<Self>, E>
+    where
+        E: From<AllocError>,
+    {
+        let mut this = try_new_uninit_in!(Arc, alloc);
+        let Some(slot) = Arc::get_mut(&mut this) else {
+            // SAFETY: the Arc has just been created and has no external referecnes
+            unsafe { core::hint::unreachable_unchecked() }
+        };
+        let slot = slot.as_mut_ptr();
+        // SAFETY: When init errors/panics, slot will get deallocated but not dropped,
+        // slot is valid and will not be moved, because we pin it later.
+        unsafe { init.__pinned_init(slot)? };
+        // SAFETY: All fields have been initialized and this is the only `Arc` to that data.
+        Ok(unsafe { Pin::new_unchecked(this.assume_init()) })
+    }
+    fn try_init_in<E>(init: impl Init<T, E>, alloc: A) -> Result<Self, E>
+    where
+        E: From<AllocError>,
+    {
+        let mut this = try_new_uninit_in!(Arc, alloc);
+        let Some(slot) = Arc::get_mut(&mut this) else {
+            // SAFETY: the Arc has just been created and has no external referecnes
+            unsafe { core::hint::unreachable_unchecked() }
+        };
+        let slot = slot.as_mut_ptr();
+        // SAFETY: When init errors/panics, slot will get deallocated but not dropped,
+        // slot is valid.
+        unsafe { init.__init(slot)? };
+        // SAFETY: All fields have been initialized.
+        Ok(unsafe { this.assume_init() })
     }
 }
 
@@ -1279,7 +1384,7 @@ impl<T> InPlaceInit<T> for Arc<T> {
 }
 
 /// Smart pointer containing uninitialized memory and that can write a value.
-pub trait InPlaceWrite<T> {
+pub trait InPlaceWrite<T, A: Allocator = Global> {
     /// The type `Self` turns into when the contents are initialized.
     type Initialized;
 
@@ -1295,8 +1400,8 @@ pub trait InPlaceWrite<T> {
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-impl<T> InPlaceWrite<T> for Box<MaybeUninit<T>> {
-    type Initialized = Box<T>;
+impl<T, A: Allocator + 'static> InPlaceWrite<T, A> for Box<MaybeUninit<T>, A> {
+    type Initialized = Box<T, A>;
 
     fn write_init<E>(mut self, init: impl Init<T, E>) -> Result<Self::Initialized, E> {
         let slot = self.as_mut_ptr();
